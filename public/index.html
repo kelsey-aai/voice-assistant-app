@@ -1,0 +1,527 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Voice assistant — AssemblyAI Voice Agent API</title>
+    <style>
+      :root {
+        --bg: #0b0d12;
+        --panel: #141821;
+        --panel-2: #1c2230;
+        --border: #262d3d;
+        --text: #e6e9f2;
+        --muted: #8b94a7;
+        --accent: #5b8def;
+        --accent-2: #4cc9a0;
+        --danger: #ef5b5b;
+        --user: #2a3a5c;
+        --agent: #1f3530;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+          "Helvetica Neue", Arial, sans-serif;
+        background: var(--bg);
+        color: var(--text);
+        min-height: 100vh;
+      }
+      .app {
+        max-width: 920px;
+        margin: 0 auto;
+        padding: 32px 24px 64px;
+      }
+      header {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 24px;
+      }
+      h1 {
+        font-size: 22px;
+        font-weight: 600;
+        margin: 0;
+      }
+      .status {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        font-size: 13px;
+        color: var(--muted);
+      }
+      .dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 50%;
+        background: var(--muted);
+      }
+      .dot.connecting { background: #e6c25b; animation: pulse 1.2s infinite; }
+      .dot.connected  { background: var(--accent-2); }
+      .dot.error      { background: var(--danger); }
+      @keyframes pulse {
+        0%, 100% { opacity: 1; }
+        50%      { opacity: 0.35; }
+      }
+      .config {
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 16px;
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 16px;
+        margin-bottom: 16px;
+      }
+      label {
+        display: block;
+        font-size: 12px;
+        color: var(--muted);
+        margin-bottom: 6px;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+      }
+      select, textarea {
+        width: 100%;
+        background: var(--panel-2);
+        color: var(--text);
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 10px 12px;
+        font-size: 14px;
+        font-family: inherit;
+      }
+      textarea {
+        resize: vertical;
+        min-height: 60px;
+      }
+      .config .full { grid-column: 1 / -1; }
+      .controls {
+        display: flex;
+        gap: 12px;
+        margin-bottom: 16px;
+      }
+      button {
+        font: inherit;
+        padding: 12px 18px;
+        border-radius: 8px;
+        border: 1px solid var(--border);
+        background: var(--panel-2);
+        color: var(--text);
+        cursor: pointer;
+        transition: background 0.15s ease, transform 0.05s ease;
+      }
+      button:hover:not(:disabled) { background: #232a3b; }
+      button:active:not(:disabled) { transform: translateY(1px); }
+      button:disabled { opacity: 0.5; cursor: not-allowed; }
+      button.primary {
+        background: var(--accent);
+        border-color: var(--accent);
+        color: #fff;
+        font-weight: 600;
+      }
+      button.primary:hover:not(:disabled) { background: #4778dd; }
+      button.danger {
+        background: var(--danger);
+        border-color: var(--danger);
+        color: #fff;
+        font-weight: 600;
+      }
+      .transcript {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 16px;
+        height: 460px;
+        overflow-y: auto;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+      .empty {
+        margin: auto;
+        color: var(--muted);
+        font-size: 14px;
+        text-align: center;
+      }
+      .bubble {
+        max-width: 78%;
+        padding: 10px 14px;
+        border-radius: 14px;
+        font-size: 15px;
+        line-height: 1.45;
+        white-space: pre-wrap;
+        word-wrap: break-word;
+      }
+      .bubble.user {
+        align-self: flex-end;
+        background: var(--user);
+        border-bottom-right-radius: 4px;
+      }
+      .bubble.agent {
+        align-self: flex-start;
+        background: var(--agent);
+        border-bottom-left-radius: 4px;
+      }
+      .bubble.partial { opacity: 0.6; font-style: italic; }
+      .bubble .meta {
+        display: block;
+        font-size: 11px;
+        color: var(--muted);
+        margin-top: 4px;
+      }
+      footer {
+        margin-top: 16px;
+        color: var(--muted);
+        font-size: 12px;
+        text-align: center;
+      }
+      footer a { color: var(--accent); text-decoration: none; }
+    </style>
+  </head>
+  <body>
+    <div class="app">
+      <header>
+        <h1>Voice Assistant</h1>
+        <span class="status" id="status">
+          <span class="dot" id="status-dot"></span>
+          <span id="status-text">Disconnected</span>
+        </span>
+      </header>
+
+      <div class="config">
+        <div>
+          <label for="voice">Voice</label>
+          <select id="voice">
+            <option value="ivy">Ivy (US, professional)</option>
+            <option value="james">James (US, conversational)</option>
+            <option value="tyler">Tyler (US)</option>
+            <option value="autumn">Autumn (US)</option>
+            <option value="sam">Sam (US)</option>
+            <option value="mia">Mia (US)</option>
+            <option value="bella">Bella (US)</option>
+            <option value="sophie">Sophie (UK female)</option>
+            <option value="oliver">Oliver (UK male)</option>
+            <option value="arjun">Arjun (Hindi/Hinglish)</option>
+            <option value="pierre">Pierre (French)</option>
+            <option value="lena">Lena (German)</option>
+            <option value="diego">Diego (Spanish, Latin American)</option>
+            <option value="giulia">Giulia (Italian)</option>
+            <option value="ren">Ren (Japanese)</option>
+            <option value="mina">Mina (Korean)</option>
+          </select>
+        </div>
+        <div>
+          <label for="greeting">Greeting</label>
+          <select id="greeting">
+            <option value="Hi there — what can I help you with?">Friendly opener</option>
+            <option value="Hello, this is your voice assistant. How can I help?">Professional opener</option>
+            <option value="Hey! What's on your mind today?">Casual opener</option>
+          </select>
+        </div>
+        <div class="full">
+          <label for="prompt">System prompt</label>
+          <textarea id="prompt">You are a friendly voice assistant. Keep replies to one or two short sentences. Speak naturally, like a real person.</textarea>
+        </div>
+      </div>
+
+      <div class="controls">
+        <button class="primary" id="connect">Connect</button>
+        <button class="danger" id="disconnect" disabled>Disconnect</button>
+        <button id="clear">Clear transcript</button>
+      </div>
+
+      <div class="transcript" id="transcript">
+        <div class="empty" id="empty">
+          Configure your voice and prompt above, then press Connect to start talking.
+        </div>
+      </div>
+
+      <footer>
+        Powered by the
+        <a href="https://www.assemblyai.com/docs/voice-agents/voice-agent-api" target="_blank" rel="noreferrer">
+          AssemblyAI Voice Agent API
+        </a>.
+      </footer>
+    </div>
+
+    <script>
+      // -----------------------------------------------------------------------
+      // Voice Agent API browser client
+      //
+      // Flow:
+      //   1. fetch /api/voice-token  → single-use temp token from our server
+      //   2. open WebSocket to wss://agents.assemblyai.com/v1/ws?token=...
+      //   3. send session.update FIRST (system_prompt, greeting, voice)
+      //   4. wait for session.ready, then start the AudioWorklet
+      //   5. AudioWorklet posts Int16 PCM frames → base64 → input.audio
+      //   6. server streams reply.audio (base64 PCM @ 24 kHz) → schedule via
+      //      AudioBufferSourceNode using a running playbackTime cursor.
+      //   7. on reply.done {status:"interrupted"}, stop scheduled sources and
+      //      reset the playbackTime cursor so stale audio is never heard.
+      // -----------------------------------------------------------------------
+
+      const SAMPLE_RATE = 24_000; // audio/pcm default for Voice Agent API
+      const WS_URL = "wss://agents.assemblyai.com/v1/ws";
+
+      const els = {
+        connect: document.getElementById("connect"),
+        disconnect: document.getElementById("disconnect"),
+        clear: document.getElementById("clear"),
+        voice: document.getElementById("voice"),
+        prompt: document.getElementById("prompt"),
+        greeting: document.getElementById("greeting"),
+        transcript: document.getElementById("transcript"),
+        empty: document.getElementById("empty"),
+        statusDot: document.getElementById("status-dot"),
+        statusText: document.getElementById("status-text"),
+      };
+
+      let ws = null;
+      let audioCtx = null;
+      let micStream = null;
+      let workletNode = null;
+      let micSource = null;
+      let playbackTime = 0;        // next reply.audio scheduled time (s)
+      let scheduledSources = [];   // for flushing on barge-in
+      let userPartialEl = null;    // streaming partial bubble
+
+      function setStatus(state, text) {
+        els.statusDot.className = "dot " + state;
+        els.statusText.textContent = text;
+      }
+
+      function clearTranscript() {
+        els.transcript.innerHTML = "";
+        els.transcript.appendChild(els.empty);
+        userPartialEl = null;
+      }
+
+      function ensureBubble(role, partial = false) {
+        if (els.empty.parentNode) els.empty.remove();
+        const div = document.createElement("div");
+        div.className = "bubble " + role + (partial ? " partial" : "");
+        els.transcript.appendChild(div);
+        els.transcript.scrollTop = els.transcript.scrollHeight;
+        return div;
+      }
+
+      function addBubble(role, text, meta) {
+        const div = ensureBubble(role);
+        div.textContent = text;
+        if (meta) {
+          const span = document.createElement("span");
+          span.className = "meta";
+          span.textContent = meta;
+          div.appendChild(span);
+        }
+        els.transcript.scrollTop = els.transcript.scrollHeight;
+      }
+
+      async function fetchToken() {
+        const res = await fetch("/api/voice-token");
+        if (!res.ok) throw new Error("Failed to fetch token: " + res.status);
+        const { token } = await res.json();
+        return token;
+      }
+
+      async function connect() {
+        els.connect.disabled = true;
+        setStatus("connecting", "Requesting token…");
+
+        let token;
+        try {
+          token = await fetchToken();
+        } catch (err) {
+          console.error(err);
+          setStatus("error", "Token error");
+          els.connect.disabled = false;
+          return;
+        }
+
+        // Force the AudioContext to 24 kHz so we never have to resample.
+        audioCtx = new (window.AudioContext || window.webkitAudioContext)({
+          sampleRate: SAMPLE_RATE,
+        });
+        playbackTime = audioCtx.currentTime;
+        scheduledSources = [];
+
+        try {
+          micStream = await navigator.mediaDevices.getUserMedia({
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true,
+              channelCount: 1,
+            },
+          });
+        } catch (err) {
+          console.error("Mic permission denied:", err);
+          setStatus("error", "Mic blocked");
+          els.connect.disabled = false;
+          return;
+        }
+
+        await audioCtx.audioWorklet.addModule("pcm-processor.js");
+        micSource = audioCtx.createMediaStreamSource(micStream);
+        workletNode = new AudioWorkletNode(audioCtx, "pcm-processor");
+
+        setStatus("connecting", "Connecting…");
+        ws = new WebSocket(`${WS_URL}?token=${encodeURIComponent(token)}`);
+        ws.binaryType = "arraybuffer";
+
+        ws.onopen = () => {
+          ws.send(
+            JSON.stringify({
+              type: "session.update",
+              session: {
+                system_prompt: els.prompt.value,
+                greeting: els.greeting.value,
+                output: { voice: els.voice.value },
+              },
+            }),
+          );
+        };
+
+        ws.onmessage = (evt) => handleEvent(JSON.parse(evt.data));
+
+        ws.onerror = (err) => {
+          console.error("WebSocket error:", err);
+          setStatus("error", "Connection error");
+        };
+
+        ws.onclose = (evt) => {
+          console.log("WebSocket closed:", evt.code, evt.reason);
+          teardown();
+        };
+
+        // Pump mic audio whenever the worklet has a frame ready.
+        workletNode.port.onmessage = (e) => {
+          if (!ws || ws.readyState !== WebSocket.OPEN) return;
+          const audio = arrayBufferToBase64(e.data);
+          ws.send(JSON.stringify({ type: "input.audio", audio }));
+        };
+      }
+
+      function handleEvent(event) {
+        switch (event.type) {
+          case "session.ready":
+            setStatus("connected", `Connected (${event.session_id})`);
+            els.disconnect.disabled = false;
+            // Now safe to start sending audio.
+            micSource.connect(workletNode);
+            // Don't connect worklet to destination — we don't want mic in speakers.
+            break;
+
+          case "transcript.user.delta":
+            if (!userPartialEl) userPartialEl = ensureBubble("user", true);
+            userPartialEl.textContent = event.text;
+            els.transcript.scrollTop = els.transcript.scrollHeight;
+            break;
+
+          case "transcript.user":
+            if (userPartialEl) {
+              userPartialEl.classList.remove("partial");
+              userPartialEl.textContent = event.text;
+              userPartialEl = null;
+            } else {
+              addBubble("user", event.text);
+            }
+            break;
+
+          case "reply.audio":
+            playPCM(event.data);
+            break;
+
+          case "transcript.agent": {
+            const meta = event.interrupted ? "interrupted" : null;
+            addBubble("agent", event.text, meta);
+            break;
+          }
+
+          case "reply.done":
+            if (event.status === "interrupted") flushPlayback();
+            break;
+
+          case "session.error":
+            console.error("Session error:", event);
+            setStatus("error", `${event.code}: ${event.message}`);
+            break;
+
+          // session.updated, input.speech.started, input.speech.stopped,
+          // reply.started, tool.call — handled implicitly or out of scope.
+        }
+      }
+
+      function playPCM(b64) {
+        // Decode base64 → Int16 → Float32, then schedule on the playback cursor.
+        const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
+        const int16 = new Int16Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 2);
+        const float32 = new Float32Array(int16.length);
+        for (let i = 0; i < int16.length; i++) float32[i] = int16[i] / 0x8000;
+
+        const buffer = audioCtx.createBuffer(1, float32.length, SAMPLE_RATE);
+        buffer.getChannelData(0).set(float32);
+
+        const source = audioCtx.createBufferSource();
+        source.buffer = buffer;
+        source.connect(audioCtx.destination);
+
+        const now = audioCtx.currentTime;
+        if (playbackTime < now) playbackTime = now;
+        source.start(playbackTime);
+        playbackTime += buffer.duration;
+
+        scheduledSources.push(source);
+        source.onended = () => {
+          scheduledSources = scheduledSources.filter((s) => s !== source);
+        };
+      }
+
+      function flushPlayback() {
+        // User barged in — drop everything we'd queued for the agent.
+        for (const src of scheduledSources) {
+          try { src.stop(); } catch (_) {}
+        }
+        scheduledSources = [];
+        playbackTime = audioCtx.currentTime;
+      }
+
+      function teardown() {
+        try { workletNode && workletNode.disconnect(); } catch (_) {}
+        try { micSource && micSource.disconnect(); } catch (_) {}
+        try { micStream && micStream.getTracks().forEach((t) => t.stop()); } catch (_) {}
+        try { audioCtx && audioCtx.close(); } catch (_) {}
+        ws = null;
+        audioCtx = null;
+        micStream = null;
+        workletNode = null;
+        micSource = null;
+        scheduledSources = [];
+        userPartialEl = null;
+        setStatus("", "Disconnected");
+        els.connect.disabled = false;
+        els.disconnect.disabled = true;
+      }
+
+      function disconnect() {
+        if (ws && ws.readyState === WebSocket.OPEN) ws.close();
+        else teardown();
+      }
+
+      function arrayBufferToBase64(buf) {
+        const bytes = new Uint8Array(buf);
+        let binary = "";
+        const chunk = 0x8000;
+        for (let i = 0; i < bytes.length; i += chunk) {
+          binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+        }
+        return btoa(binary);
+      }
+
+      els.connect.addEventListener("click", connect);
+      els.disconnect.addEventListener("click", disconnect);
+      els.clear.addEventListener("click", clearTranscript);
+    </script>
+  </body>
+</html>
