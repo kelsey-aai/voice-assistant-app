@@ -1,54 +1,44 @@
-// Tiny Express server for the voice assistant app.
-//
-// Two responsibilities:
-//   1. Serve the static frontend in /public.
-//   2. Mint single-use temporary tokens for the browser at /api/voice-token,
-//      so the AssemblyAI API key never leaves the server.
-//
-// The browser fetches a fresh token before every WebSocket connection.
-
-import express from "express";
-import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+// server.js: serves the app, mints temporary tokens and calls the LLM.
+// Your API key never leaves this process.
 import "dotenv/config";
+import express from "express";
+import { AssemblyAI } from "assemblyai";
 
-const API_KEY = process.env.ASSEMBLYAI_API_KEY;
-if (!API_KEY) {
-  console.error("Missing ASSEMBLYAI_API_KEY in environment. Copy .env.example to .env and add your key.");
-  process.exit(1);
-}
-
-const PORT = process.env.PORT || 3000;
-const TOKEN_TTL_SECONDS = 300; // 1-600
-
-const __dirname = dirname(fileURLToPath(import.meta.url));
+const client = new AssemblyAI({ apiKey: process.env.ASSEMBLYAI_API_KEY });
 const app = express();
+app.use(express.json());
+app.use(express.static("public"));
+// The SDK's browser build is one self-contained ES module; serve it to the page.
+app.get("/vendor/assemblyai.mjs", (req, res) =>
+  res.sendFile("node_modules/assemblyai/dist/browser.mjs", { root: process.cwd() })
+);
 
-app.use(express.static(join(__dirname, "public")));
-
-app.get("/api/voice-token", async (_req, res) => {
+// One call mints both tokens: speech-to-text and text-to-speech each need their own.
+app.get("/api/tokens", async (req, res) => {
   try {
-    const url = new URL("https://agents.assemblyai.com/v1/token");
-    url.searchParams.set("expires_in_seconds", String(TOKEN_TTL_SECONDS));
-
-    const response = await fetch(url, {
-      headers: { Authorization: `Bearer ${API_KEY}` },
-    });
-
-    if (!response.ok) {
-      const body = await response.text();
-      console.error(`Token mint failed: ${response.status} ${body}`);
-      return res.status(502).json({ error: "Failed to mint token" });
-    }
-
-    const { token } = await response.json();
-    res.json({ token, expires_in_seconds: TOKEN_TTL_SECONDS });
+    const [stt, tts] = await Promise.all([
+      client.streaming.createTemporaryToken({ expires_in_seconds: 60 }),
+      client.tts.createTemporaryToken({ expires_in_seconds: 60 }),
+    ]);
+    res.json({ stt, tts });
   } catch (err) {
-    console.error("Token mint error:", err);
-    res.status(500).json({ error: "Internal error" });
+    res.status(502).json({ error: err.message });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`Voice assistant app running at http://localhost:${PORT}`);
+// The LLM call stays on the server too, through LLM Gateway with the same key.
+app.post("/api/reply", async (req, res) => {
+  const { systemPrompt, messages } = req.body;
+  try {
+    const completion = await client.llmGateway.chatCompletions({
+      model: "qwen3.5-4b-32k-fast", // any model from the LLM Gateway model list
+      messages: [{ role: "system", content: systemPrompt }, ...messages],
+      max_tokens: 200,
+    });
+    res.json({ text: completion.choices[0].message.content });
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
 });
+
+app.listen(3000, () => console.log("Open http://localhost:3000"));

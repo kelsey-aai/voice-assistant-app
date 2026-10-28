@@ -1,381 +1,179 @@
-# Build a voice assistant app with AssemblyAI's Voice Agent API
+# Build a browser voice assistant app with AssemblyAI
 
-A production-shaped browser voice assistant in under 400 lines. Click **Connect**, talk into your laptop mic, and the agent talks back — over a single WebSocket, with the API key safely behind a tiny Node server.
+A conversational voice assistant that runs in a browser tab. Click **Connect**, talk into your mic, and the assistant talks back. The whole pipeline runs on one AssemblyAI API key, which stays on a small Node server:
 
-This is the "real app" version of the [5-minute quickstart](../5min-quickstart): a polished UI, AudioWorklet mic capture, temporary-token auth, and full barge-in handling. The **AssemblyAI Voice Agent API** does the speech recognition, the LLM, and the TTS server-side — you're just shuttling audio bytes.
+- **Speech-to-text:** [Universal-3.6 Pro Realtime](https://www.assemblyai.com/blog/universal-3-6-pro-realtime) (`universal-3-6-pro`) over a raw WebSocket, with turn detection built in
+- **LLM:** any model from [LLM Gateway](https://www.assemblyai.com/docs/llm-gateway/available-models), called from the server
+- **Text-to-speech:** the [AssemblyAI Text-to-Speech API](https://www.assemblyai.com/products/text-to-speech) (`assemblyai-tts-1`), opened in the browser with the SDK's `TextToSpeechSession`
 
-## Why one WebSocket beats a multi-service pipeline
+Companion code for the blog post **[Build a voice assistant app with AssemblyAI](https://www.assemblyai.com/blog/build-a-voice-assistant-app-with-assemblyai)**.
 
-A traditional browser voice agent needs you to wire up streaming STT, an LLM, and a TTS provider, then orchestrate audio routing between them in the browser. Every hop adds latency, every provider needs a key, and every glue layer adds a failure mode.
+## What's in the repo
 
-| | Multi-service browser pipeline | Voice Agent API |
-|---|---|---|
-| Services to wire up | STT + LLM + TTS (3+ vendors) | 1 |
-| API keys to manage | 3+ | 1 |
-| Round trips per turn | 3 (mic→STT→LLM→TTS→speaker) | 1 (mic→agent→speaker) |
-| Browser key exposure | Hard to avoid | Solved by temp tokens |
-| Turn detection | Configure separately | Built in |
-| Barge-in / interruption | Implement yourself | Built in |
-| Tool calling | Wire LLM tools manually | Built in |
-
-The endpoint is one URL: `wss://agents.assemblyai.com/v1/ws`. Send 24 kHz PCM, get 24 kHz PCM back. That's it.
+| File | What it does |
+|------|--------------|
+| `server.js` | Serves the app and the SDK's browser build, mints speech-to-text and text-to-speech temporary tokens on `/api/tokens`, and calls the LLM through LLM Gateway on `/api/reply`. Your API key never leaves this process. |
+| `public/pcm-worklet.js` | AudioWorklet that resamples mic audio to 16 kHz, 16-bit PCM off the main thread |
+| `public/app.js` | The client: tokens, mic capture, the speech-to-text WebSocket, the `TextToSpeechSession`, gapless Web Audio playback, barge-in and a clean hang-up |
+| `public/index.html` | The page: voice picker, system prompt, Connect / Hang up |
 
 ## Architecture
 
 ```
-Browser (index.html)                          Node server (server.js)
-┌────────────────────────────────┐           ┌────────────────────────────┐
-│ getUserMedia({ echoCancel })   │           │ GET /api/voice-token       │
-│       │                        │  fetch    │   ↓                        │
-│       ▼                        │ ────────► │ Authorization: Bearer KEY  │
-│ AudioWorklet (pcm-processor)   │           │ → agents.assemblyai.com/   │
-│   Float32 → Int16 PCM          │  token    │   v1/token                 │
-│       │                        │ ◄──────── │ → { token }                │
-│       ▼                        │           └────────────────────────────┘
-│ WebSocket  ?token=…            │
-└──────┬─────────────────────────┘
-       │  { type: "input.audio", audio: "<base64>" }
-       │  { type: "session.update", session: {…} }
-       ▼
-┌─────────────────────────────────────────────────┐
-│  wss://agents.assemblyai.com/v1/ws              │
-│                                                 │
-│  AssemblyAI Voice Agent API                     │
-│  ├── Universal-3 Pro Streaming  (speech → text) │
-│  ├── LLM                        (text → reply)  │
-│  └── TTS                        (reply → audio) │
-│                                                 │
-│  + neural turn detection                        │
-│  + barge-in handling                            │
-│  + tool calling                                 │
-└──────┬──────────────────────────────────────────┘
-       │  { type: "reply.audio", data: "<base64 PCM>" }
-       │  { type: "transcript.user" / "transcript.agent" }
-       ▼
-┌────────────────────────────────┐
-│ AudioBufferSourceNode schedule │
-│   playbackTime cursor          │
-│   on barge-in: stop+reset      │
-└────────────────────────────────┘
+Browser                                              Node server (server.js)
+┌──────────────────────────────────────┐            ┌─────────────────────────────────────┐
+│ Connect ──► GET /api/tokens ─────────┼──────────► │ client.streaming.createTemporaryToken│
+│                                      │ ◄───────── │ client.tts.createTemporaryToken      │
+│                                      │ { stt, tts}└─────────────────────────────────────┘
+│ getUserMedia ─► AudioWorklet         │
+│   (resample to 16 kHz Int16 PCM)     │
+│        │                             │
+│        ▼                             │
+│ WebSocket ?token=stt ────────────────┼──► wss://streaming.assemblyai.com/v3/ws
+│   Begin / Turn / Termination ◄───────┼──   speech_model=universal-3-6-pro
+│        │ end_of_turn: true           │
+│        ▼                             │            ┌─────────────────────────────────────┐
+│ POST /api/reply ─────────────────────┼──────────► │ client.llmGateway.chatCompletions   │
+│        ◄──── { text } ───────────────┼─────────── └─────────────────────────────────────┘
+│        │                             │
+│        ▼                             │
+│ TextToSpeechSession({ token: tts })  ├──► wss://tts.us.assemblyai.com/v1/ws
+│   for await (chunk of tts.speak())   │      raw 16-bit PCM (24 kHz by default)
+│        ▼                             │
+│ AudioBufferSourceNode scheduling     │
+│ Turn while speaking → tts.cancel()   │
+│   + stop scheduled audio (barge-in)  │
+└──────────────────────────────────────┘
 ```
+
+| Event | What the app does |
+|-------|-------------------|
+| Speech-to-text `Begin` | Start streaming mic audio |
+| `Turn` with `end_of_turn: false` | Show a live partial transcript |
+| `Turn` with `end_of_turn: true` | Commit the user's message and ask the LLM for a reply |
+| `Turn` while the agent is speaking | Barge in: `cancel()` the speech and stop playback (one-word backchannels like "mhm" are ignored) |
+| Audio chunks from `speak()` | Convert Int16 to Float32 and schedule playback |
+| Speech-to-text `Termination` | Close the speech session, release the mic |
 
 ## Prerequisites
 
-- Node.js 18+ (uses native `fetch` and ES modules)
-- A modern browser (Chrome 66+, Firefox 76+, Safari 14.1+ — anything with `AudioWorklet`)
-- An [AssemblyAI API key](https://www.assemblyai.com/dashboard/signup) — free tier available
+- Node.js 18+ (native `fetch` and ES modules)
+- A modern browser with AudioWorklet support (current Chrome, Edge, Firefox or Safari)
+- An [AssemblyAI API key](https://www.assemblyai.com/dashboard/signup). LLM Gateway may require a paid account; if yours doesn't have access, point `/api/reply` at your own LLM provider.
 
-The browser needs a secure origin to access the mic. `http://localhost` counts as secure, so you can develop locally without TLS. If you deploy this anywhere else, serve it over HTTPS.
+The browser only allows mic access on a secure origin. `http://localhost` counts, so you can develop locally without TLS. Deploy anywhere else over HTTPS.
 
 ## Quick start
-
-### 1. Clone and install
 
 ```bash
 git clone https://github.com/kelsey-aai/voice-assistant-app
 cd voice-assistant-app
 
-npm install
+npm install          # express, dotenv, assemblyai (4.42.0 or later)
+cp .env.example .env # then set ASSEMBLYAI_API_KEY
+npm start            # same as: node server.js
 ```
 
-### 2. Configure your API key
+Open [http://localhost:3000](http://localhost:3000), click **Connect**, allow the mic and start talking. The assistant greets you, your words appear as a partial transcript and then a final message, and the agent's reply plays back.
 
-```bash
-cp .env.example .env
-# Edit .env — drop in your AssemblyAI API key
-```
-
-### 3. Run the app
-
-```bash
-npm start
-```
-
-Open [http://localhost:3000](http://localhost:3000), pick a voice, hit **Connect**, grant mic permission, and start talking. You'll see your speech transcribed live as a partial bubble, then committed to a final bubble, with the agent's reply streaming back in audio and text.
-
-```
-Voice Assistant                              ● Connected (sess_…)
-
-You:   What can you do?
-Agent: I can chat, answer questions, or help work through ideas — whatever
-       you'd like.
-```
-
-That's the whole app. About 70 lines of server, ~400 of client (including UI styles).
+The only environment variable is `ASSEMBLYAI_API_KEY`. It covers speech-to-text, LLM Gateway and text-to-speech.
 
 ## How it works
 
-There are four moving parts: the token mint, the AudioWorklet that captures mic audio, the WebSocket loop that drives the conversation, and the playback scheduler that turns `reply.audio` events back into sound.
+### 1. The server mints temporary tokens and calls the LLM
 
-### 1. The server mints a temporary token
-
-Your AssemblyAI API key never leaves the server. The browser asks `/api/voice-token` for a single-use token, valid for 5 minutes:
+`/api/tokens` mints two tokens in one call, because speech-to-text and text-to-speech each need their own. `expires_in_seconds` is the window in which each token can open its connection; a session that is already open isn't affected when its token expires.
 
 ```js
-// server.js
-app.get("/api/voice-token", async (_req, res) => {
-  const url = new URL("https://agents.assemblyai.com/v1/token");
-  url.searchParams.set("expires_in_seconds", "300");
+const [stt, tts] = await Promise.all([
+  client.streaming.createTemporaryToken({ expires_in_seconds: 60 }),
+  client.tts.createTemporaryToken({ expires_in_seconds: 60 }),
+]);
+```
 
-  const response = await fetch(url, {
-    headers: { Authorization: `Bearer ${API_KEY}` },
-  });
-  const { token } = await response.json();
-  res.json({ token });
+`/api/reply` sends the system prompt and the conversation to LLM Gateway with the same key:
+
+```js
+const completion = await client.llmGateway.chatCompletions({
+  model: "qwen3.5-4b-32k-fast", // any model from the LLM Gateway model list
+  messages: [{ role: "system", content: systemPrompt }, ...messages],
+  max_tokens: 200,
 });
 ```
 
-Tokens are single-use — you fetch a fresh one for every connection. The browser then opens the WebSocket with the token as a query parameter:
+The model name is an example; pick any model from the [LLM Gateway model list](https://www.assemblyai.com/docs/llm-gateway/available-models). Before you deploy, put authentication and rate limiting in front of both routes, since anyone who can reach them can spend your credits.
+
+The server also serves the SDK's browser build at `/vendor/assemblyai.mjs`, so the page can `import { TextToSpeechSession } from "/vendor/assemblyai.mjs"` without a bundler.
+
+### 2. An AudioWorklet captures and resamples mic audio
+
+`public/pcm-worklet.js` runs on its own audio thread. It resamples from whatever rate the browser uses to 16 kHz, clips and posts Int16 buffers to the page. Safari ignores a requested `AudioContext` sample rate, and Firefox bypasses its echo canceller at non-default rates, so resampling in the worklet works the same everywhere and leaves the page's `AudioContext` at its native rate for playback.
+
+### 3. Two sockets, two tokens
+
+`connect()` in `public/app.js` opens the text-to-speech session with its token and the speech-to-text WebSocket with the other. Neither needs an API key in the page.
 
 ```js
-ws = new WebSocket(`wss://agents.assemblyai.com/v1/ws?token=${token}`);
-```
-
-### 2. The AudioWorklet captures mic audio
-
-`AudioWorklet` runs your PCM conversion off the main thread, which keeps it glitch-free. The worklet receives Float32 samples (`-1.0..1.0`), clips them to range, and posts them back as a transferable `Int16Array` buffer:
-
-```js
-// public/pcm-processor.js
-class PCMProcessor extends AudioWorkletProcessor {
-  process(inputs) {
-    const channel = inputs[0]?.[0];
-    if (!channel) return true;
-
-    const pcm = new Int16Array(channel.length);
-    for (let i = 0; i < channel.length; i++) {
-      const s = Math.max(-1, Math.min(1, channel[i]));
-      pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-    }
-    this.port.postMessage(pcm.buffer, [pcm.buffer]);
-    return true;
-  }
-}
-```
-
-The Voice Agent API expects 24 kHz PCM by default, so we force the entire `AudioContext` to 24 kHz on creation — no resampling needed:
-
-```js
-audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE }); // 24000
-```
-
-We also enable browser-level acoustic echo cancellation when grabbing the mic, so the agent doesn't interrupt itself by hearing its own TTS through the speakers:
-
-```js
-navigator.mediaDevices.getUserMedia({
-  audio: {
-    echoCancellation: true,
-    noiseSuppression: true,
-    autoGainControl: true,
-    channelCount: 1,
-  },
+tts = new TextToSpeechSession({
+  token: tokens.tts,
+  voiceId: document.querySelector("#voice").value,
+  language: "english",
 });
+await tts.connect(); // resolves with the Begin frame
+
+const params = new URLSearchParams({
+  speech_model: "universal-3-6-pro",
+  encoding: "pcm_s16le",
+  sample_rate: "16000",
+  token: tokens.stt,
+});
+stt = new WebSocket(`wss://streaming.assemblyai.com/v3/ws?${params}`);
 ```
 
-### 3. The WebSocket drives the conversation
+Mic audio starts flowing after `Begin`, batched into ~100 ms messages. When a `Turn` arrives with `end_of_turn: true`, the app sends the conversation to `/api/reply`.
 
-`session.update` is the first message — it configures system prompt, greeting, and voice. After that, you stream `input.audio` events whenever the worklet hands you a frame:
+### 4. Speak the reply and play raw PCM without gaps
 
-```js
-ws.onopen = () => {
-  ws.send(JSON.stringify({
-    type: "session.update",
-    session: {
-      system_prompt: prompt.value,
-      greeting: "Hi there — what can I help you with?",
-      output: { voice: "ivy" },
-    },
-  }));
-};
+`speakReply()` calls `tts.speak(text)`, which sends the text, flushes it and yields raw PCM as it's synthesized, so playback starts with the first chunk. The audio has no header, so the app converts each chunk to Float32, copies it into an `AudioBuffer` at the rate the session reported in `Begin` (`tts.begin.configuration.sample_rate`, 24 kHz by default), and schedules each buffer where the previous one ends.
 
-workletNode.port.onmessage = (e) => {
-  ws.send(JSON.stringify({
-    type: "input.audio",
-    audio: arrayBufferToBase64(e.data),
-  }));
-};
-```
+### 5. Barge-in
 
-The server replies with a stream of events. The ones we care about for UI:
+While the agent is talking, a `Turn` of two or more words is a real interruption. `stopPlayback()` calls `tts.cancel()`, which stops the request in flight and ends the `speak()` loop at once, then stops every scheduled `AudioBufferSourceNode` and resets the playback cursor. Shorter turns ("mhm", "okay") are ignored; raise `MIN_WORDS` in `public/app.js` if short filler still gets through.
 
-| Event | What we do with it |
-|-------|--------------------|
-| `session.ready` | Save the `session_id`, start sending audio |
-| `transcript.user.delta` | Render a partial bubble (italic, low-opacity) as the user speaks |
-| `transcript.user` | Promote the partial to a final user message |
-| `reply.audio` | Decode base64 PCM, schedule playback (see below) |
-| `transcript.agent` | Render the agent's final reply (with `interrupted` if applicable) |
-| `reply.done` (with `status: "interrupted"`) | Flush queued audio — user barged in |
-| `session.error` | Surface error code in the status indicator |
+### 6. Hang up cleanly
 
-### 4. Reply playback uses a scheduling cursor
+**Hang up** sends `{"type": "Terminate"}` on the speech-to-text socket. The server finalizes the open turn and answers with `Termination`, and the app then calls `tts.close()`, which sends its own Terminate and waits for the session summary, and releases the mic and audio context.
 
-`reply.audio` chunks arrive faster than they play — sometimes the whole reply is buffered before the first sample hits the speaker. Naively calling `source.start(0)` would overlap the chunks. Instead, we keep a `playbackTime` cursor and schedule each chunk back-to-back:
+## Customize
 
-```js
-function playPCM(b64) {
-  const bytes  = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
-  const int16  = new Int16Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 2);
-  const float  = new Float32Array(int16.length);
-  for (let i = 0; i < int16.length; i++) float[i] = int16[i] / 0x8000;
+**Voice.** The dropdown sets `voiceId` on the text-to-speech session. It accepts a voice's UUID (the default is Audrey, `49c443a4-8a1d-5f7e-b70b-98bdbd9823c3`) or a library slug such as `aai-sara`. See the [voices guide](https://www.assemblyai.com/docs/tts/voices). To speak Spanish, French, German, Italian or Portuguese, set `language` to the language's English name, such as `"spanish"`. Voice and language are fixed for a session, so set them before you connect.
 
-  const buffer = audioCtx.createBuffer(1, float.length, SAMPLE_RATE);
-  buffer.getChannelData(0).set(float);
+**System prompt.** The prompt travels with every `/api/reply` request, so edit the textarea and the next turn uses it. In production, keep the prompt on the server and let the page send only the conversation. Keep replies short and in full sentences with punctuation; the text-to-speech model takes its pacing and tone from the punctuation.
 
-  const source = audioCtx.createBufferSource();
-  source.buffer = buffer;
-  source.connect(audioCtx.destination);
+**Turn detection.** Universal-3.6 Pro Realtime decides when a turn ends on its own, and its defaults suit most conversations. Start there.
 
-  const now = audioCtx.currentTime;
-  if (playbackTime < now) playbackTime = now;
-  source.start(playbackTime);
-  playbackTime += buffer.duration;
-
-  scheduledSources.push(source);
-}
-```
-
-### 5. Barge-in stops scheduled audio cold
-
-When the user speaks over the agent, the server emits `reply.done` with `status: "interrupted"` and trims `transcript.agent` to what was actually spoken. The client's job is to drop any audio that was scheduled but hasn't played yet — otherwise the user hears the agent finishing a sentence after they've already moved on:
-
-```js
-function flushPlayback() {
-  for (const src of scheduledSources) {
-    try { src.stop(); } catch (_) {}
-  }
-  scheduledSources = [];
-  playbackTime = audioCtx.currentTime;
-}
-```
-
-That's the entire interruption story: stop every scheduled `AudioBufferSourceNode`, reset the cursor to "now."
-
-## Customization
-
-### Pick a different voice
-
-The voice picker is wired to `session.output.voice`. The dropdown ships 16 popular options — drop any voice ID into the `<select>` to add more. Eighteen English voices and 16 multilingual voices are available in total:
-
-```html
-<option value="james">James (US, conversational)</option>
-<option value="diego">Diego (Spanish, Latin American)</option>
-<option value="arjun">Arjun (Hindi/Hinglish)</option>
-```
-
-See the [Voices catalog](https://www.assemblyai.com/docs/voice-agents/voice-agent-api/voices) for samples of each. Multilingual voices code-switch with English automatically.
-
-### Change the personality with the system prompt
-
-The textarea is bound to `session.system_prompt`. Tighten it for shorter replies, give it a persona, or scope it to a specific use case:
-
-```text
-You are a customer-support agent for Acme Cloud Storage. Only answer
-questions about Acme's products, plans, and account billing. If the user
-asks about anything else, politely redirect.
-```
-
-You can also re-send `session.update` mid-conversation to swap personas live. (Note: `greeting` and `output` are immutable after the first apply — only `system_prompt`, `tools`, and `input` can change mid-session.)
-
-### Tune turn detection
-
-Add `input.turn_detection` to the `session.update` payload to control how patient the agent feels:
-
-```js
-session: {
-  input: {
-    turn_detection: {
-      vad_threshold: 0.5,        // 0.0–1.0; higher = less sensitive
-      min_silence: 600,          // ms; min silence before end-of-turn check
-      max_silence: 1500,         // ms; hard cap before forcing end-of-turn
-      interrupt_response: true,  // false to disable barge-in entirely
-    },
-  },
-}
-```
-
-For noisy environments, raise `vad_threshold`. For deliberate speech (healthcare, eldercare) raise `max_silence`.
+**Tools.** Tools live in the LLM request. To give the LLM a function, replace the `/api/reply` route with one that passes OpenAI-style `tools` to `client.llmGateway.chatCompletions`, runs the function the model asks for, appends the result as a `tool` message and calls the model again. The browser code doesn't change. The full route is in the blog post.
 
 ## Troubleshooting
 
-**`Mic blocked` or no audio going up.** Browsers only allow `getUserMedia` on secure origins. `http://localhost` counts; `http://your-laptop.local` doesn't. If you're testing across devices, terminate TLS in front of the Node server (Caddy, Cloudflare Tunnel, ngrok).
+**Mic blocked or no audio going up.** `getUserMedia` only works on secure origins. `http://localhost` counts; `http://your-laptop.local` doesn't. Also make sure `audioCtx.resume()` runs inside the click handler.
 
-**Agent keeps interrupting itself.** Acoustic echo — the mic is picking up the speakers. Use headphones, or confirm `echoCancellation: true` is set on `getUserMedia`. The browser's OS-level AEC is much better than anything you'll write yourself.
+**Agent keeps interrupting itself.** Acoustic echo: the mic is picking up the speakers. Confirm `echoCancellation: true` and use headphones while developing.
 
-**Audio sounds chipmunky or slowed-down.** Sample-rate mismatch. The `AudioContext` must be created with `{ sampleRate: 24000 }`. If you skip that, the browser creates the context at 44.1 or 48 kHz and the math falls apart.
+**Transcripts are garbled.** Sample-rate mismatch. Every byte must go through the worklet's resampler, since the speech-to-text URL says `sample_rate=16000`.
 
-**`UNAUTHORIZED` close on connect.** Token wasn't included, expired, or was already used. Tokens are single-use — fetch a fresh one for every connection. Confirm `ASSEMBLYAI_API_KEY` is set on the server.
+**Replies arrive but nothing plays.** The speech session sends raw PCM with no header. Play it through the Web Audio API at the rate in `tts.begin.configuration.sample_rate`.
 
-**WebSocket closes with code 1006 and no error.** Pre-handshake failure. In browsers, that's usually a stale or invalid token. Re-fetch the token before reconnecting.
+**`connect()` rejects as unauthorized, or a socket closes with 1008.** The token expired before the connection opened, or it was minted for the wrong product. Speech-to-text and text-to-speech each need their own token. Fetch fresh tokens for every connection and confirm `ASSEMBLYAI_API_KEY` is set on the server.
 
-The full troubleshooting guide is in the [Voice Agent API docs](https://www.assemblyai.com/docs/voice-agents/voice-agent-api/troubleshooting).
-
-## Related tutorials
-
-- **Voice Agent API 5-minute quickstart** — minimal Python quickstart — the simplest version of this stack
-- **Voice agent that makes outbound calls** — Twilio outbound + Media Streams bridge with `audio/pcmu`
-- **Twilio phone agent** — inbound phone calls — Twilio Media Streams + `audio/pcmu`
-- **LiveKit voice agent** — Voice Agent API behind a LiveKit room for multi-user / WebRTC
-- **Agora voice agent** — Voice Agent API behind an Agora RTC channel
-- **Daily.co voice agent** — Voice Agent API behind a Daily room using `daily-python`
-- **Node.js voice agent** — JavaScript version of the 5-minute quickstart
-- **Raw WebSocket voice agent** — every protocol event handled explicitly, with tool calling and session resume
-
-## FAQ
-
-### What is AssemblyAI's Voice Agent API?
-
-AssemblyAI's Voice Agent API is a single WebSocket endpoint that handles the entire voice agent pipeline server-side — speech-to-text, LLM reasoning, and text-to-speech — so you can build a conversational voice agent without wiring up separate STT, LLM, and TTS providers. It includes neural turn detection, barge-in, tool calling, and 30+ voices out of the box. The endpoint is `wss://agents.assemblyai.com/v1/ws`.
-
-### How do I use the Voice Agent API from the browser without exposing my API key?
-
-Run a small backend that mints short-lived [temporary tokens](https://www.assemblyai.com/docs/voice-agents/voice-agent-api/browser-integration) by calling `GET https://agents.assemblyai.com/v1/token` with your API key in an `Authorization: Bearer` header. The browser fetches a fresh token from your server before each WebSocket connection and passes it as `?token=` in the URL. Tokens are single-use and expire in 1–600 seconds. This tutorial's `server.js` shows the full pattern.
-
-### What audio format does the browser need to send to the Voice Agent API?
-
-By default, the Voice Agent API expects `audio/pcm` — 16-bit signed little-endian PCM at 24,000 Hz, mono, base64-encoded. From the browser, the cleanest way to produce that is to create the `AudioContext` with `{ sampleRate: 24000 }` so no resampling is needed, then use an `AudioWorklet` to convert Float32 mic samples to `Int16Array` and base64-encode the buffer before sending it as `{ "type": "input.audio", "audio": "..." }`.
-
-### How do I handle interruption (barge-in) in a browser voice agent?
-
-When the user speaks while the agent is replying, the server emits `reply.done` with `status: "interrupted"` and a `transcript.agent` event with `interrupted: true` and the text trimmed to what was actually spoken. The browser must stop any `AudioBufferSourceNode`s it has already scheduled with `source.start(playbackTime)` and reset its `playbackTime` cursor to `audioCtx.currentTime` so the next reply starts cleanly. Otherwise, queued audio plays after the user has already moved on.
-
-### Why does my voice agent keep interrupting itself in the browser?
-
-Almost always acoustic echo: the mic is picking up the agent's TTS output through the speakers, which the server interprets as the user starting a new turn and triggers barge-in. Pass `echoCancellation: true` to `navigator.mediaDevices.getUserMedia({ audio: { ... } })` to enable the browser's OS-level acoustic echo cancellation, and prefer headphones during development. Browser AEC is dramatically better than anything you'd implement by hand.
-
-### Can the Voice Agent API call tools or functions from the browser?
-
-Yes — tool calling works the same way client-side. Register tool definitions in `session.tools` on a `session.update` event. When the agent decides to call a tool, the server emits a `tool.call` event with `call_id`, `name`, and `arguments` (a dict). Execute the tool in your client code, then send a `tool.result` event when you receive the next `reply.done` (not immediately on `tool.call`). See the [tool calling guide](https://www.assemblyai.com/docs/voice-agents/voice-agent-api/tool-calling) for the full pattern.
-
-### How much does the AssemblyAI Voice Agent API cost?
-
-AssemblyAI offers a free tier so you can build and test without a credit card. For current pricing, see the [AssemblyAI pricing page](https://www.assemblyai.com/pricing).
+**The speech session closes after two idle minutes.** Call `tts.keepAlive()` on a timer while the user is quiet, or reconnect with fresh tokens. See the [limits page](https://www.assemblyai.com/docs/tts/limits).
 
 ## Resources
 
-- [Voice Agent API overview](https://www.assemblyai.com/docs/voice-agents/voice-agent-api)
-- [Browser integration guide](https://www.assemblyai.com/docs/voice-agents/voice-agent-api/browser-integration)
-- [Session configuration](https://www.assemblyai.com/docs/voice-agents/voice-agent-api/session-configuration)
-- [Audio format](https://www.assemblyai.com/docs/voice-agents/voice-agent-api/audio-format)
-- [Events reference](https://www.assemblyai.com/docs/voice-agents/voice-agent-api/events-reference)
-- [Voices catalog](https://www.assemblyai.com/docs/voice-agents/voice-agent-api/voices)
-- [Tool calling](https://www.assemblyai.com/docs/voice-agents/voice-agent-api/tool-calling)
-- [Troubleshooting](https://www.assemblyai.com/docs/voice-agents/voice-agent-api/troubleshooting)
-
----
-
-<div class="blog-cta_component">
-  <div class="blog-cta_title">Ship a browser voice agent today</div>
-  <div class="blog-cta_rt w-richtext">
-    <p>Sign up for a free AssemblyAI account and put a real voice assistant on your website with the Voice Agent API. No credit card required.</p>
-  </div>
-  <a href="https://www.assemblyai.com/dashboard/signup" class="button w-button">Start building</a>
-</div>
-
-<div class="blog-cta_component">
-  <div class="blog-cta_title">Read the browser-integration guide</div>
-  <div class="blog-cta_rt w-richtext">
-    <p>The official walkthrough of temporary tokens, AudioWorklet capture, and reply scheduling for the Voice Agent API. Pair it with this tutorial for a complete picture.</p>
-  </div>
-  <a href="https://www.assemblyai.com/docs/voice-agents/voice-agent-api/browser-integration" class="button w-button">Read the docs</a>
-</div>
+- [Blog post: Build a voice assistant app with AssemblyAI](https://www.assemblyai.com/blog/build-a-voice-assistant-app-with-assemblyai)
+- [Text-to-Speech quickstart](https://www.assemblyai.com/docs/tts/getting-started/quickstart)
+- [Choose a text-to-speech interface](https://www.assemblyai.com/docs/tts/getting-started/choose-an-interface)
+- [Text-to-speech voices](https://www.assemblyai.com/docs/tts/voices)
+- [Streaming speech-to-text](https://www.assemblyai.com/docs/streaming/getting-started/transcribe-streaming-audio)
+- [LLM Gateway quickstart](https://www.assemblyai.com/docs/llm-gateway/quickstart)
+- [AssemblyAI JavaScript SDK](https://github.com/AssemblyAI/assemblyai-node-sdk)
